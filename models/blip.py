@@ -127,13 +127,9 @@ class BLIP_Decoder(nn.Module):
         
     def generate(self, image, sample=False, num_beams=3, max_length=30, min_length=10, top_p=0.9, repetition_penalty=1.0):
         image_embeds = self.visual_encoder(image)
-
-        if not sample:
-            image_embeds = image_embeds.repeat_interleave(num_beams,dim=0)
-            
+        # HF beam search expands encoder states internally; keep original batch size to avoid mismatched shapes.
         image_atts = torch.ones(image_embeds.size()[:-1],dtype=torch.long).to(image.device)
         model_kwargs = {"encoder_hidden_states": image_embeds, "encoder_attention_mask":image_atts}
-        
         prompt = [self.prompt] * image.size(0)
         input_ids = self.tokenizer(prompt, return_tensors="pt").input_ids.to(image.device) 
         input_ids[:,0] = self.tokenizer.bos_token_id

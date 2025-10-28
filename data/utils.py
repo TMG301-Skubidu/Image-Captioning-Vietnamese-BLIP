@@ -50,7 +50,8 @@ def save_result(result, result_dir, filename, remove_duplicate=''):
     
     json.dump(result,open(result_file,'w'))
 
-    dist.barrier()
+    if utils.is_dist_avail_and_initialized():
+        dist.barrier()
 
     if utils.is_main_process():   
         # combine results from all processes
@@ -83,11 +84,20 @@ from torchvision.datasets.utils import download_url
 
 def coco_caption_eval(coco_gt_root, results_file, split):
     urls = {'val':'https://storage.googleapis.com/sfr-vision-language-research/datasets/coco_karpathy_val_gt.json',
-            'test':'https://storage.googleapis.com/sfr-vision-language-research/datasets/coco_karpathy_test_gt.json'}
+            'test':'https://storage.googleapis.com/sfr-vision-language-research/datasets/coco_karpathy_test_gt.json'}    
     filenames = {'val':'coco_karpathy_val_gt.json','test':'coco_karpathy_test_gt.json'}    
     
     download_url(urls[split],coco_gt_root)
     annotation_file = os.path.join(coco_gt_root,filenames[split])
+
+    # Some hosted Karpathy JSON files are missing the optional COCO 'info' section.
+    # Newer pycocotools assumes the key exists, so patch up the annotation in-place.
+    with open(annotation_file, 'r') as f:
+        annotation_data = json.load(f)
+    if 'info' not in annotation_data:
+        annotation_data['info'] = {"description": "Inserted to satisfy pycocotools"}
+        with open(annotation_file, 'w') as f:
+            json.dump(annotation_data, f)
     
     # create coco object and coco_result object
     coco = COCO(annotation_file)

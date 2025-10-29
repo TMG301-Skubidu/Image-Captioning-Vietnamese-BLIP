@@ -12,9 +12,20 @@ class nocaps_eval(Dataset):
                 'test':'https://storage.googleapis.com/sfr-vision-language-research/datasets/nocaps_test.json'}
         filenames = {'val':'nocaps_val.json','test':'nocaps_test.json'}
         
-        download_url(urls[split],ann_root)
+        # Prefer local annotation files if present; only download when missing.
+        ann_path = os.path.join(ann_root, filenames[split])
+        if not os.path.exists(ann_path):
+            try:
+                download_url(urls[split], ann_root)
+            except Exception as e:  # pragma: no cover - offline or network failure
+                # Fallback to local-only if provided by the user (e.g., Kaggle Data tab)
+                pass
         
-        self.annotation = json.load(open(os.path.join(ann_root,filenames[split]),'r'))
+        if not os.path.exists(ann_path):
+            # If still missing, raise a clear error
+            raise FileNotFoundError(f"Missing NoCaps annotation file: {ann_path}")
+        
+        self.annotation = json.load(open(ann_path,'r'))
         self.transform = transform
         self.image_root = image_root
         

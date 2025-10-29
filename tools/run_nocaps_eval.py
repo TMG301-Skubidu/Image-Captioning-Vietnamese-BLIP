@@ -1,6 +1,9 @@
 import argparse
 import json
 import os
+import re
+import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -11,9 +14,12 @@ from typing import Dict, List, Optional, Tuple
 
 import requests
 try:
-    import ruamel_yaml as yaml
+    import ruamel_yaml as yaml  # type: ignore[import]
 except ModuleNotFoundError:  # pragma: no cover - optional dependency name
-    from ruamel import yaml  # type: ignore
+    try:
+        from ruamel import yaml  # type: ignore
+    except ModuleNotFoundError:  # pragma: no cover - final fallback
+        import yaml  # type: ignore
 from tqdm import tqdm
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -52,6 +58,83 @@ def fetch_image(url: str, dest: Path, retries: int, timeout: int) -> Tuple[bool,
     return False, last_err
 
 
+def _index_openimages(root: Optional[Path]) -> Dict[str, Path]:
+    """Build an index of Open Images files by ID (stem, case-insensitive)."""
+    index: Dict[str, Path] = {}
+    if root is None or not root.exists():
+        return index
+    for p in root.rglob("*.jp*g"):
+        index[p.stem.lower()] = p.resolve()
+    for p in root.rglob("*.png"):
+        index[p.stem.lower()] = p.resolve()
+    return index
+
+
+def _try_copy(src: Optional[Path], dest: Path) -> bool:
+    if src is None:
+        return False
+    try:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if not dest.exists():
+            shutil.copyfile(str(src), str(dest))
+        return True
+    except Exception:
+        return False
+
+
+def _detect_coco_split(file_name: str, url: Optional[str]) -> Optional[str]:
+    s = (url or "") + " " + file_name
+    if "train2014" in s:
+        return "train2014"
+    if "val2014" in s:
+        return "val2014"
+    if re.search(r"_train2014_", file_name):
+        return "train2014"
+    if re.search(r"_val2014_", file_name):
+        return "val2014"
+    return None
+
+
+def _ensure_openimages_cli(pip_install: bool) -> bool:
+    try:
+        completed = subprocess.run(["openimages", "--help"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if completed.returncode == 0:
+            return True
+    except Exception:
+        pass
+    if not pip_install:
+        return False
+    try:
+        subprocess.run([sys.executable, "-m", "pip", "install", "-q", "openimages"], check=True)
+        completed = subprocess.run(["openimages", "--help"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return completed.returncode == 0
+    except Exception:
+        return False
+
+
+def _download_openimages_id(image_id: str, tmp_dir: Path, timeout: int) -> Optional[Path]:
+    try:
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        subprocess.run(
+            ["openimages", "download", "--image", image_id, "--destination", str(tmp_dir)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout * 3 if timeout else None,
+            check=False,
+        )
+        stem = image_id.lower()
+        for ext in (".jpg", ".jpeg", ".png"):
+            c1 = tmp_dir / f"{stem}{ext}"
+            if c1.exists():
+                return c1
+        for p in tmp_dir.rglob("*"):
+            if p.is_file() and p.stem.lower() == stem:
+                return p
+    except Exception:
+        return None
+    return None
+
+
 def convert_split(
     raw_data: Dict,
     split: str,
@@ -60,6 +143,11 @@ def convert_split(
     timeout: int,
     skip_download: bool,
     workers: int,
+    coco_train_root: Optional[Path],
+    coco_val_root: Optional[Path],
+    openimages_index: Dict[str, Path],
+    use_openimages_cli: bool,
+    pip_install_openimages: bool,
 ) -> Tuple[List[Dict], List[Dict]]:
     """Create BLIP-ready annotations and download missing images for one split."""
     images = raw_data["images"]
@@ -73,19 +161,69 @@ def convert_split(
     converted: List[Dict] = []
     failures: List[Dict] = []
 
+    _openimages_ready = None  # lazy init
+
     def process_image(img: Dict) -> Tuple[Optional[Dict], Optional[Dict]]:
         file_name = img["file_name"]
         url = img.get("coco_url") or img.get("flickr_url")
-        if not url:
-            return None, {"file_name": file_name, "reason": "missing_url"}
+        openimg_id = img.get("open_images_id") or img.get("openimages_id")
 
         dest = image_root / split / file_name
-        if not dest.exists():
+        if dest.exists():
+            pass
+        else:
+            # 1) Try local COCO mapping
+            if url:
+                coco_split = _detect_coco_split(file_name, url)
+                src: Optional[Path] = None
+                if coco_split == "train2014" and coco_train_root is not None:
+                    c = coco_train_root / file_name
+                    if c.exists():
+                        src = c
+                elif coco_split == "val2014" and coco_val_root is not None:
+                    c = coco_val_root / file_name
+                    if c.exists():
+                        src = c
+                if _try_copy(src, dest):
+                    entry = {"image": f"{split}/{file_name}", "img_id": int(img["id"])}
+                    if id_to_captions:
+                        entry["captions"] = id_to_captions.get(int(img["id"]), [])
+                    return entry, None
+
+            # 2) Try Open Images index
+            if openimg_id:
+                src2 = openimages_index.get(str(openimg_id).lower())
+                if _try_copy(src2, dest):
+                    entry = {"image": f"{split}/{file_name}", "img_id": int(img["id"])}
+                    if id_to_captions:
+                        entry["captions"] = id_to_captions.get(int(img["id"]), [])
+                    return entry, None
+
+            # 3) If skipping downloads, report missing
             if skip_download:
                 return None, {"file_name": file_name, "reason": "missing_local_file"}
-            success, err = fetch_image(url, dest, retries=retries, timeout=timeout)
-            if not success:
-                return None, {"file_name": file_name, "reason": err}
+
+            # 4) Try Open Images CLI if permitted
+            if openimg_id and use_openimages_cli:
+                nonlocal _openimages_ready
+                if _openimages_ready is None:
+                    _openimages_ready = _ensure_openimages_cli(pip_install_openimages)
+                if _openimages_ready:
+                    tmp_dir = image_root / "_tmp_openimages" / split
+                    downloaded = _download_openimages_id(str(openimg_id), tmp_dir, timeout=timeout)
+                    if downloaded and _try_copy(downloaded, dest):
+                        entry = {"image": f"{split}/{file_name}", "img_id": int(img["id"])}
+                        if id_to_captions:
+                            entry["captions"] = id_to_captions.get(int(img["id"]), [])
+                        return entry, None
+
+            # 5) Fallback to HTTP if URL exists
+            if url:
+                success, err = fetch_image(url, dest, retries=retries, timeout=timeout)
+                if not success:
+                    return None, {"file_name": file_name, "reason": err}
+            else:
+                return None, {"file_name": file_name, "reason": "no_source"}
 
         entry = {"image": f"{split}/{file_name}", "img_id": int(img["id"])}
         if id_to_captions:
@@ -227,6 +365,35 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="Skip HTTP downloads and assume images are already present under --image-root.",
     )
+    # Optional local dataset roots for mapping instead of downloading
+    parser.add_argument(
+        "--coco-train-root",
+        type=Path,
+        default=None,
+        help="Path to COCO train2014 images to avoid re-downloading.",
+    )
+    parser.add_argument(
+        "--coco-val-root",
+        type=Path,
+        default=None,
+        help="Path to COCO val2014 images to avoid re-downloading.",
+    )
+    parser.add_argument(
+        "--openimages-root",
+        type=Path,
+        default=None,
+        help="Path to a local Open Images dataset for ID-based mapping.",
+    )
+    parser.add_argument(
+        "--use-openimages-cli",
+        action="store_true",
+        help="Use the 'openimages' CLI to download images by ID when missing.",
+    )
+    parser.add_argument(
+        "--pip-install-openimages",
+        action="store_true",
+        help="Attempt to pip install the 'openimages' package if CLI is unavailable.",
+    )
     return parser.parse_args(argv)
 
 
@@ -257,6 +424,9 @@ def main(argv: Optional[List[str]] = None) -> None:
     with open(test_json, "r", encoding="utf-8") as f:
         test_raw = json.load(f)
 
+    # Build Open Images index if provided
+    openimages_index = _index_openimages(args.openimages_root.resolve() if args.openimages_root else None)
+
     val_entries, val_failures = convert_split(
         val_raw,
         "val",
@@ -265,6 +435,11 @@ def main(argv: Optional[List[str]] = None) -> None:
         timeout=args.timeout,
         skip_download=args.no_download,
         workers=args.workers,
+        coco_train_root=(args.coco_train_root.resolve() if args.coco_train_root else None),
+        coco_val_root=(args.coco_val_root.resolve() if args.coco_val_root else None),
+        openimages_index=openimages_index,
+        use_openimages_cli=bool(args.use_openimages_cli),
+        pip_install_openimages=bool(args.pip_install_openimages),
     )
     test_entries, test_failures = convert_split(
         test_raw,
@@ -274,6 +449,11 @@ def main(argv: Optional[List[str]] = None) -> None:
         timeout=args.timeout,
         skip_download=args.no_download,
         workers=args.workers,
+        coco_train_root=(args.coco_train_root.resolve() if args.coco_train_root else None),
+        coco_val_root=(args.coco_val_root.resolve() if args.coco_val_root else None),
+        openimages_index=openimages_index,
+        use_openimages_cli=bool(args.use_openimages_cli),
+        pip_install_openimages=bool(args.pip_install_openimages),
     )
 
     val_out = ann_root / "nocaps_val.json"

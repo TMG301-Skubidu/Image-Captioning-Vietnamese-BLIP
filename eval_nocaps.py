@@ -8,9 +8,12 @@
 import argparse
 import os
 try:
-    import ruamel_yaml as yaml
+    import ruamel_yaml as yaml  # type: ignore[import]
 except ModuleNotFoundError:  # pragma: no cover - optional dependency name
-    from ruamel import yaml  # type: ignore
+    try:
+        from ruamel import yaml  # type: ignore
+    except ModuleNotFoundError:  # pragma: no cover - final fallback
+        import yaml  # type: ignore
 import numpy as np
 import random
 import time
